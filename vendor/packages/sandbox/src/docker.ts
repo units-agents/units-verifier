@@ -1,0 +1,388 @@
+import { randomBytes } from "node:crypto";
+import { chmodSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import type { Limits } from "@units/protocol";
+import { resolvePinnedImage } from "./local-images.ts";
+
+// Docker runner, SPEC section 8. Every container is labelled lineage=1 so cleanup never touches
+// anything else on the machine.
+
+export interface Mount {
+  host: string;
+  container: string;
+  readonly?: boolean;
+}
+
+export interface RunSpec {
+  image: string;
+  cmd: string;
+  cwd: string;
+  mounts: Mount[];
+  network: boolean;
+  env: Record<string, string>;
+  limits: Limits;
+  timeout_s: number;
+  job: string;
+  /** cap on captured stdout and stderr each, bytes */
+  capture_limit?: number;
+  /**
+   * GPU device request for cuda-class recipes (SPEC 6.1, 8), passed as `docker run --gpus <value>`,
+   * for example "device=0". Unset for every other recipe. Nothing else is added for GPUs: no
+   * capabilities, no extra devices (performance counters are opened on the host, see images/cuda).
+   */
+  gpus?: string;
+}
+
+export interface RunResult {
+  exit: number;
+  stdout: string;
+  stderr: string;
+  duration_ms: number;
+  timed_out: boolean;
+  truncated: boolean;
+}
+
+const CAPTURE = 4 * 1024 * 1024;
+
+async function readCapped(stream: ReadableStream<Uint8Array>, limit: number): Promise<{ text: string; truncated: boolean }> {
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  let truncated = false;
+  // a reader loop rather than `for await`: this file is also typechecked under the DOM lib (apps/web
+  // scripts import Core), whose ReadableStream type has no async iterator
+  const reader = stream.getReader();
+  for (;;) {
+    const { done, value: chunk } = await reader.read();
+    if (done) break;
+    if (size < limit) {
+      const take = chunk.subarray(0, Math.max(0, limit - size));
+      chunks.push(take);
+      size += take.length;
+      if (take.length < chunk.length) truncated = true;
+    } else truncated = true;
+  }
+  return { text: Buffer.concat(chunks).toString("utf8"), truncated };
+}
+
+/**
+ * Optional OCI runtime for sandbox containers (UNITS_DOCKER_RUNTIME, e.g. `runsc` for gVisor on a
+ * Linux worker). Unset means Docker's default runtime.
+ */
+export function dockerRuntime(env: Record<string, string | undefined> = process.env): string | null {
+  const v = (env.UNITS_DOCKER_RUNTIME ?? env.LINEAGE_DOCKER_RUNTIME)?.trim();
+  if (!v) return null;
+  if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(v)) throw new Error(`UNITS_DOCKER_RUNTIME must be a runtime name, got ${JSON.stringify(v)}`);
+  return v;
+}
+
+/**
+ * Optional relative CPU weight of sandbox containers (UNITS_SANDBOX_CPU_SHARES, Docker --cpu-shares;
+ * Docker's default is 1024). A lower weight only matters when the host's CPUs are contended: Core,
+ * the gate and sshd then get their share first. It never changes an instruction count.
+ */
+export function sandboxCpuShares(env: Record<string, string | undefined> = process.env): number | null {
+  const v = env.UNITS_SANDBOX_CPU_SHARES?.trim();
+  if (!v) return null;
+  const n = Number(v);
+  if (!(Number.isInteger(n) && n >= 2 && n <= 262144)) throw new Error(`UNITS_SANDBOX_CPU_SHARES must be a whole number from 2 to 262144, got ${JSON.stringify(v)}`);
+  return n;
+}
+
+/**
+ * Sandbox slots (UNITS_SANDBOX_SLOTS=<n>, UNITS_SANDBOX_SLOTS_DIR): at most n sandbox containers run
+ * at once on this host, across every process that sets the same directory (verifiers, the reference
+ * runner, authors, the hosted runtime's attempts). Unset: no limit, as before. On the site 3 attempts,
+ * 2 verifiers, the reference runner and 18 scripted authors could each start a container on 4 vCPUs
+ * (load average 16 to 28, 2026-10-12). A slot is a lock file holding its owner's pid; a file whose
+ * owner is gone is taken over. Waiting changes when a run starts, never what it measures.
+ */
+export function sandboxSlots(env: Record<string, string | undefined> = process.env): { n: number; dir: string } | null {
+  const v = env.UNITS_SANDBOX_SLOTS?.trim();
+  if (!v || v === "0") return null;
+  const n = Number(v);
+  if (!(Number.isInteger(n) && n >= 1 && n <= 256)) throw new Error(`UNITS_SANDBOX_SLOTS must be a whole number from 1 to 256, got ${JSON.stringify(v)}`);
+  return { n, dir: env.UNITS_SANDBOX_SLOTS_DIR?.trim() || "/tmp/units-sandbox-slots" };
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Takes a free slot (waiting for one), returns its release. `slots` null: no limit. */
+export async function acquireSandboxSlot(slots = sandboxSlots(), o: { pollMs?: number; alive?: (pid: number) => boolean } = {}): Promise<() => void> {
+  if (!slots) return () => {};
+  const alive = o.alive ?? pidAlive;
+  try {
+    mkdirSync(slots.dir, { recursive: true });
+    // any service account on the host may hold a slot and clear one whose owner is gone
+    chmodSync(slots.dir, 0o777);
+  } catch {
+    /* another account made it */
+  }
+  for (;;) {
+    for (let i = 0; i < slots.n; i++) {
+      const file = join(slots.dir, `slot-${i}`);
+      try {
+        writeFileSync(file, `${process.pid}\n`, { flag: "wx", mode: 0o644 });
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          try {
+            unlinkSync(file);
+          } catch {
+            /* cleared by another process after this one was taken for dead */
+          }
+        };
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw new Error(`sandbox slots: ${(e as Error).message}`);
+        // held: by a process that is gone (killed in mid-run)? then the slot is free again
+        try {
+          const pid = Number(readFileSync(file, "utf8").trim());
+          // a file just created and not written yet reads as 0: its owner is alive
+          if (pid > 0 && !alive(pid)) unlinkSync(file);
+        } catch {
+          /* released in the meantime */
+        }
+      }
+    }
+    await Bun.sleep((o.pollMs ?? 1000) * (0.5 + Math.random()));
+  }
+}
+
+export function dockerArgs(spec: RunSpec, name: string): string[] {
+  const l = spec.limits;
+  const args = [
+    "run",
+    "--rm",
+    "--name",
+    name,
+    // fixed hostname: Docker otherwise injects a random HOSTNAME, and environment size shifts instruction counts
+    "--hostname",
+    "lineage",
+    "--label",
+    "lineage=1",
+    // rebrand transition (docs/plans/REBRAND-UNITS.md 3.10): both labels, cleanup matches either
+    "--label",
+    "units=1",
+    "--label",
+    `lineage.job=${spec.job}`,
+    // which machine of a site started it (capacity hosts set UNITS_SANDBOX_HOST; docs/plans/SCALE-OUT.md)
+    ...(/^[a-z0-9-]{1,32}$/.test(process.env.UNITS_SANDBOX_HOST ?? "") ? ["--label", `units.host=${process.env.UNITS_SANDBOX_HOST}`] : []),
+    "--user",
+    containerUser(),
+    "--cap-drop",
+    "ALL",
+    "--security-opt",
+    "no-new-privileges",
+    "--read-only",
+    "--tmpfs",
+    "/tmp:rw,exec,size=512m",
+    "--cpus",
+    String(l.cpus),
+    "--memory",
+    `${l.memory_mb}m`,
+    "--memory-swap",
+    `${l.memory_mb}m`,
+    "--pids-limit",
+    String(l.pids),
+    "--workdir",
+    spec.cwd,
+  ];
+  if (!spec.network) args.push("--network", "none");
+  const shares = sandboxCpuShares();
+  if (shares) args.push("--cpu-shares", String(shares));
+  const runtime = dockerRuntime();
+  if (runtime) args.push("--runtime", runtime);
+  if (spec.gpus) args.push("--gpus", spec.gpus);
+  for (const m of spec.mounts) args.push("--volume", `${m.host}:${m.container}${m.readonly ? ":ro" : ""}`);
+  const env = {
+    TZ: "UTC",
+    LANG: "C.UTF-8",
+    CI: "1",
+    HOME: "/tmp",
+    PYTHONHASHSEED: "0",
+    CARGO_INCREMENTAL: "0",
+    ...spec.env,
+  };
+  for (const [k, v] of Object.entries(env)) args.push("--env", `${k}=${v}`);
+  args.push(spec.image, "sh", "-c", spec.cmd);
+  return args;
+}
+
+export async function runContainer(spec: RunSpec): Promise<RunResult> {
+  const name = `lineage-${spec.job.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 40)}-${randomBytes(4).toString("hex")}`;
+  // at most UNITS_SANDBOX_SLOTS containers at once on this host; the run's own clock starts after the wait
+  const release = await acquireSandboxSlot();
+  try {
+    return await runHeld(spec, name);
+  } finally {
+    release();
+  }
+}
+
+/**
+ * The sandbox could not be started at all: docker is not there, this process's working directory is
+ * gone, the daemon does not answer or cannot create the container (docker run's own exit 125). It says
+ * nothing about the code under test, so it is never a build or test result: a verifier that reported
+ * it as "base build failed" failed qualifications it could have passed (cap-nyc1, 2026-10-12), and on a
+ * replay it would be a wrong verdict by a bonded verifier. Callers retry it as an error of the machine.
+ */
+export class SandboxUnavailable extends Error {}
+
+async function runHeld(spec: RunSpec, name: string): Promise<RunResult> {
+  const started = performance.now();
+  let proc: ReturnType<typeof Bun.spawn<"ignore", "pipe", "pipe">>;
+  try {
+    proc = Bun.spawn(["docker", ...dockerArgs(spec, name)], { stdout: "pipe", stderr: "pipe" });
+  } catch (e) {
+    throw new SandboxUnavailable(`the sandbox could not be started: ${(e as Error).message.slice(0, 200)}`);
+  }
+  let timed_out = false;
+  const timer = setTimeout(() => {
+    timed_out = true;
+    Bun.spawn(["docker", "kill", name], { stdout: "ignore", stderr: "ignore" });
+  }, spec.timeout_s * 1000);
+  const limit = spec.capture_limit ?? CAPTURE;
+  const [out, err] = await Promise.all([readCapped(proc.stdout, limit), readCapped(proc.stderr, limit)]);
+  const exit = await proc.exited;
+  clearTimeout(timer);
+  // docker run's own failure (not the command's): the daemon is down, the image is missing, the container cannot be created
+  if (!timed_out && exit === 125) throw new SandboxUnavailable(`the sandbox could not be started (docker exit 125): ${err.text.trim().split("\n").pop()?.slice(0, 200) ?? ""}`);
+  return {
+    exit: timed_out ? 124 : exit,
+    stdout: out.text,
+    stderr: err.text,
+    duration_ms: Math.round(performance.now() - started),
+    timed_out,
+    truncated: out.truncated || err.truncated,
+  };
+}
+
+export async function imageDigest(image: string): Promise<string> {
+  // a pinned id absent here runs on the local rebuild named by the local pin map (local-images.ts)
+  const ref = resolvePinnedImage(image);
+  const p = Bun.spawnSync(["docker", "image", "inspect", "--format", "{{.Id}}", ref]);
+  if (p.exitCode === 0) return p.stdout.toString().trim();
+  if (image.includes("@")) {
+    const pull = Bun.spawnSync(["docker", "pull", image]);
+    if (pull.exitCode === 0) return imageDigest(image.slice(0, image.indexOf("@")) + "@" + ref);
+  }
+  throw new Error(`image not available: ${image} (fresh clone or lost images: bun scripts/local-images.ts --build, RUNBOOK "Fresh clone or lost images")`);
+}
+
+/** The image reference to run: the pinned id when the recipe carries one (or its local rebuild). */
+export function runnableImage(image: string): string {
+  return resolvePinnedImage(image);
+}
+
+/** Removes leftover containers of ours only (crashed runs). */
+export function cleanupLineageContainers(): void {
+  const ids = [...new Set(["label=lineage=1", "label=units=1"].flatMap((f) => Bun.spawnSync(["docker", "ps", "-aq", "--filter", f]).stdout.toString().split("\n").filter(Boolean)))];
+  if (ids.length) Bun.spawnSync(["docker", "rm", "-f", ...ids]);
+}
+
+/** Architecture of a local image ("amd64" or "arm64"), as Docker reports it. */
+export function imageArch(image: string): string {
+  const ref = resolvePinnedImage(image);
+  const p = Bun.spawnSync(["docker", "image", "inspect", "--format", "{{.Architecture}}", ref]);
+  if (p.exitCode !== 0) throw new Error(`image not available: ${image}`);
+  return p.stdout.toString().trim();
+}
+
+export interface HostGpu {
+  index: number;
+  name: string;
+  /** compute capability, "8.9" */
+  sm: string;
+  driver: string;
+  mem_mb: number;
+}
+
+/** GPUs visible on the host per nvidia-smi; empty when there is no NVIDIA driver. */
+export function hostGpus(): HostGpu[] {
+  let p;
+  try {
+    p = Bun.spawnSync(["nvidia-smi", "--query-gpu=index,name,compute_cap,driver_version,memory.total", "--format=csv,noheader,nounits"]);
+  } catch {
+    return [];
+  }
+  if (p.exitCode !== 0) return [];
+  return parseNvidiaSmiGpus(p.stdout.toString());
+}
+
+export function parseNvidiaSmiGpus(out: string): HostGpu[] {
+  return out
+    .split("\n")
+    .map((l) => l.split(",").map((x) => x.trim()))
+    .filter((f) => f.length >= 5 && /^\d+$/.test(f[0]!))
+    .map((f) => ({ index: Number(f[0]), name: f[1]!, sm: f[2]!, driver: f[3]!, mem_mb: Number(f[4]) }));
+}
+
+/**
+ * The `--gpus` value for a recipe: UNITS_GPU_DEVICE (default "0") selects one host GPU, so a
+ * multi-GPU worker measures base and candidate on the same device.
+ */
+export function gpuDeviceRequest(): string {
+  const dev = ((process.env.UNITS_GPU_DEVICE ?? process.env.LINEAGE_GPU_DEVICE) ?? "0").trim();
+  if (!/^\d+$/.test(dev)) throw new Error(`UNITS_GPU_DEVICE must be a single GPU index, got ${dev}`);
+  return `device=${dev}`;
+}
+
+/**
+ * Runs `fn` while holding a host-wide lock (a directory under `dir` holding the owner's pid), so
+ * that every worker process on one machine takes turns on a shared resource. Used for GPUs: two
+ * Nsight Compute sessions, or a profiled kernel next to another process's kernels, on the same GPU
+ * would collide or disturb the counters. A lock whose owner pid is gone is taken over.
+ */
+export async function withHostLock<T>(dir: string, name: string, fn: () => Promise<T>, pollMs = 250): Promise<T> {
+  const lock = `${dir}/${name}.lock`;
+  mkdirSync(dir, { recursive: true });
+  for (;;) {
+    try {
+      mkdirSync(lock);
+      writeFileSync(`${lock}/pid`, String(process.pid));
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      let owner = 0;
+      try {
+        owner = Number(readFileSync(`${lock}/pid`, "utf8"));
+      } catch {
+        // being created right now; wait
+      }
+      let alive = true;
+      if (owner > 0) {
+        try {
+          process.kill(owner, 0);
+        } catch {
+          alive = false;
+        }
+      }
+      if (!alive) rmSync(lock, { recursive: true, force: true });
+      else await Bun.sleep(pollMs);
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    rmSync(lock, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The uid:gid sandbox containers run as. On Linux, files a container writes into bind-mounted work
+ * trees keep that owner on the host, so running as a fixed 10001 leaves build outputs (Rust
+ * `target/`) the worker cannot delete (found on the first Linux site deploy, 2026-10-08). There the
+ * container runs as the worker's own non-root user. Never root: a worker running as root still
+ * uses 10001. On macOS, Docker Desktop maps ownership, so 10001 is kept.
+ */
+export function containerUser(platform: string = process.platform, uid: number | null = process.getuid?.() ?? null, gid: number | null = process.getgid?.() ?? null): string {
+  if (platform === "linux" && uid !== null && gid !== null && uid !== 0) return `${uid}:${gid}`;
+  return "10001:10001";
+}

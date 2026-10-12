@@ -1,0 +1,169 @@
+#!/bin/sh
+# units-verifier: a thin wrapper around the units/verifier image.
+# It reads units.env, picks the network, and runs one command in a container.
+# Run it with no arguments for the list of commands.
+set -eu
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+CONF=${UNITS_CONFIG:-$HERE/units.env}
+
+# units.env: KEY=VALUE lines. A variable already set in the environment wins.
+if [ -f "$CONF" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|\#*) continue ;; esac
+    key=${line%%=*}
+    val=${line#*=}
+    case "$key" in *[!A-Za-z0-9_]*|'') continue ;; esac
+    eval "isset=\${$key+x}"
+    [ -n "$isset" ] || export "$key=$val"
+  done < "$CONF"
+fi
+
+NETWORK=${UNITS_NETWORK:-mainnet}
+CORE=${UNITS_CORE:-}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --network) NETWORK=${2:?--network needs mainnet or devnet}; shift 2 ;;
+    --core) CORE=${2:?--core needs a URL}; shift 2 ;;
+    *) break ;;
+  esac
+done
+case "$NETWORK" in
+  mainnet) SITE=${UNITS_SITE_MAINNET:-} ;;
+  devnet) SITE=${UNITS_SITE_DEVNET:-} ;;
+  *) echo "unknown network $NETWORK (mainnet or devnet)" >&2; exit 2 ;;
+esac
+[ -n "$CORE" ] || CORE=$SITE
+CORE=${CORE%/}
+
+IMAGE=${UNITS_IMAGE:-units/verifier:local}
+NAME=${UNITS_CONTAINER:-units-verifier}
+HOME_DIR=${UNITS_HOME:-/var/lib/units}
+SOCK=${UNITS_DOCKER_SOCK:-/var/run/docker.sock}
+STOP=${UNITS_STOP_TIMEOUT:-900}
+KEY=${UNITS_KEY:-./keys/agent.json}
+case "$KEY" in /*) ;; *) KEY=$HERE/${KEY#./} ;; esac
+# an extra label for the image and the containers this wrapper starts (for a machine shared with others)
+LABEL=${UNITS_EXTRA_LABEL:+--label $UNITS_EXTRA_LABEL}
+
+usage() {
+  cat <<USAGE
+units-verifier [--network mainnet|devnet] [--core <url>] <command> [arguments]
+
+network: $NETWORK    Core: ${CORE:-not set}    image: $IMAGE
+
+Set up
+  build                       build the units/verifier image from this checkout
+  images [--build] [--skip c] build the toolchain images the recipes pin (rust, python, go, cpp, zig, solana)
+  doctor [--full]             what this machine can replay (architecture, CPUs, memory, GPUs, images)
+  source                      the monorepo commit the code in the image came from
+
+Check the network yourself (no account, no key, nothing is written anywhere)
+  params                      the live parameters: burn, bond, slashes, quorum
+  latest [--n 5]              the newest accepted generations, with the ids the commands below take
+  verify [--candidate <id>]   recompute verdicts from the revealed replays (all final ones when no id)
+                              [--no-draws] [--chain | --rpc <url>] [--lineage <unit id>] [--epoch <n>]
+  verify-generation <gen id>  check a generation against its public GitHub commit
+  replay --candidate <id>     run one final candidate again in your own sandbox and compare
+  baseline <recipe> --calibration <file>   measure a recipe's baseline here and compare with a calibration
+  calibrate <recipe directory> [--runs 5]  calibrate a recipe you are writing (writes calibration.json there)
+
+Run a verifier
+  keygen                      make the worker key at $KEY (refuses to overwrite one)
+  register | bond | status | cosign ...    worker commands, with --core and --key filled in
+  run                         start the worker container (docker compose up -d)
+  logs                        follow the worker's log
+  stop                        stop it slowly: it finishes and reveals what it committed (up to $STOP s)
+  worker-help                 every worker command and option
+
+Anything else is passed to the worker CLI unchanged.
+USAGE
+}
+
+need_image() {
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "image $IMAGE is not built: run ./units-verifier build" >&2; exit 1; }
+}
+need_home() {
+  mkdir -p "$HOME_DIR" 2>/dev/null || { echo "cannot create UNITS_HOME $HOME_DIR: create it yourself or set UNITS_HOME in units.env" >&2; exit 1; }
+}
+need_key() {
+  [ -f "$KEY" ] || { echo "no worker key at $KEY: run ./units-verifier keygen" >&2; exit 1; }
+}
+tty_flag() { if [ -t 0 ] && [ -t 1 ]; then echo "-it"; else echo "-i"; fi; }
+
+# a read-only tool: no socket, no key, no state
+run_plain() {
+  need_image
+  # shellcheck disable=SC2086
+  exec docker run --rm $(tty_flag) $LABEL -e UNITS_NETWORK="$NETWORK" -e UNITS_CORE="$CORE" \
+    ${UNITS_MAINNET_RPC:+-e UNITS_MAINNET_RPC="$UNITS_MAINNET_RPC"} ${GITHUB_TOKEN:+-e GITHUB_TOKEN="$GITHUB_TOKEN"} \
+    "$IMAGE" "$@"
+}
+# a tool that starts sandboxes: the host's Docker socket and UNITS_HOME at the same path inside and out
+run_sandbox() {
+  need_image; need_home
+  # shellcheck disable=SC2086
+  exec docker run --rm $(tty_flag) $LABEL -e UNITS_NETWORK="$NETWORK" -e UNITS_CORE="$CORE" \
+    -e UNITS_HOME="$HOME_DIR" -e UNITS_LOCAL_IMAGES="$HOME_DIR/local-images.json" \
+    -v "$SOCK:/var/run/docker.sock" -v "$HOME_DIR:$HOME_DIR" ${EXTRA_MOUNT:-} \
+    "$IMAGE" "$@"
+}
+# a worker command that signs with the key
+run_key() {
+  need_image; need_key
+  # shellcheck disable=SC2086
+  exec docker run --rm $(tty_flag) $LABEL -e UNITS_NETWORK="$NETWORK" \
+    -v "$KEY:/keys/agent.json:ro" "$IMAGE" "$@"
+}
+
+cmd=${1:-help}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  help|-h|--help) usage ;;
+  build)
+    # shellcheck disable=SC2086
+    exec docker build $LABEL -t "$IMAGE" "$@" "$HERE" ;;
+  source|worker-help) run_plain "$cmd" "$@" ;;
+  params|latest) run_plain "$cmd" --core "$CORE" "$@" ;;
+  verify) run_plain verify --core "$CORE" "$@" ;;
+  verify-generation) run_plain verify-generation --core "$CORE" "$@" ;;
+  doctor)
+    need_image
+    # shellcheck disable=SC2086
+    exec docker run --rm $LABEL -v "$SOCK:/var/run/docker.sock" "$IMAGE" doctor "$@" ;;
+  images) run_sandbox images "$@" ;;
+  replay) run_sandbox replay --core "$CORE" "$@" ;;
+  calibrate|baseline)
+    # a recipe directory or a --calibration file on the host is mounted at the same path in the container
+    EXTRA_MOUNT=""; prev=""; first=1
+    for a in "$@"; do
+      if [ "$first" = 1 ]; then set --; first=0; fi
+      if [ "$prev" = "--calibration" ]; then
+        [ -f "$a" ] || { echo "no calibration file $a" >&2; exit 2; }
+        a=$(cd "$(dirname "$a")" && pwd)/$(basename "$a")
+        EXTRA_MOUNT="$EXTRA_MOUNT -v $a:$a:ro"
+      elif [ -f "$a/recipe.yml" ]; then
+        a=$(cd "$a" && pwd)
+        EXTRA_MOUNT="$EXTRA_MOUNT -v $a:$a"
+      fi
+      set -- "$@" "$a"; prev=$a
+    done
+    if [ "$cmd" = baseline ]; then run_sandbox baseline --core "$CORE" "$@"; else run_sandbox calibrate "$@"; fi ;;
+  keygen)
+    need_image
+    [ -e "$KEY" ] && { echo "$KEY exists; refusing to overwrite a key" >&2; exit 1; }
+    mkdir -p "$(dirname "$KEY")"
+    # shellcheck disable=SC2086
+    exec docker run --rm $LABEL -v "$(dirname "$KEY"):/keys" "$IMAGE" keygen --out "/keys/$(basename "$KEY")" ;;
+  register|bond|status) run_key "$cmd" --core "$CORE" --key /keys/agent.json "$@" ;;
+  cosign) run_key cosign --key /keys/agent.json "$@" ;;
+  run)
+    need_image; need_home; need_key
+    [ -n "$CORE" ] || { echo "no Core address for $NETWORK" >&2; exit 1; }
+    export UNITS_NETWORK="$NETWORK" UNITS_CORE_URL="$CORE" UNITS_HOME="$HOME_DIR" UNITS_KEY_FILE="$KEY" \
+      UNITS_IMAGE="$IMAGE" UNITS_CONTAINER="$NAME" UNITS_DOCKER_SOCK="$SOCK" UNITS_STOP_TIMEOUT="$STOP"
+    exec docker compose -f "$HERE/compose.yaml" up -d "$@" ;;
+  logs) exec docker logs -f --tail 200 "$NAME" ;;
+  stop) exec docker stop -t "$STOP" "$NAME" ;;
+  *) run_key "$cmd" "$@" ;;
+esac

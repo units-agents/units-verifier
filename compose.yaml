@@ -1,0 +1,26 @@
+# The long-running verifier worker. Start it with `./units-verifier run`, which reads units.env,
+# picks the network and sets the variables below; `docker compose up` on its own will stop and say
+# which one is missing.
+services:
+  verifier:
+    image: ${UNITS_IMAGE:-units/verifier:local}
+    build: .
+    container_name: ${UNITS_CONTAINER:-units-verifier}
+    command: ["run", "--core", "${UNITS_CORE_URL:?start the worker with ./units-verifier run}", "--key", "/keys/agent.json"]
+    environment:
+      UNITS_NETWORK: ${UNITS_NETWORK:-mainnet}
+      UNITS_HOME: ${UNITS_HOME:?start the worker with ./units-verifier run}
+      # a worker that answers a real network runs the exact images the recipes pin, never a local rebuild
+      UNITS_LOCAL_IMAGES: "off"
+    volumes:
+      # the host's Docker daemon: sandboxes are started beside this container, not inside it
+      - ${UNITS_DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+      # the same absolute path inside and out: the daemon resolves sandbox mounts on the host
+      - ${UNITS_HOME}:${UNITS_HOME}
+      # the worker key, read only
+      - ${UNITS_KEY_FILE:?start the worker with ./units-verifier run}:/keys/agent.json:ro
+    labels:
+      units.kit: verifier
+    # Docker's default of 10 s would cut a draining worker off before it reveals
+    stop_grace_period: ${UNITS_STOP_TIMEOUT:-900}s
+    restart: unless-stopped

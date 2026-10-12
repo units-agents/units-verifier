@@ -1,0 +1,13 @@
+{
+  "name": "units-verifier-vendor",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "dependencies": {
+    "@units/protocol": "workspace:*",
+    "@units/sandbox": "workspace:*",
+    "@units/chain": "workspace:*"
+  }
+}

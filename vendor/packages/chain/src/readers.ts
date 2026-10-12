@@ -1,0 +1,149 @@
+import { accountDisc, type Address } from "./codec.ts";
+import { decodeChallenge, decodeChallengeConfig, decodeChallengeGate, type ChallengeAccount, type ChallengeConfig, type ChallengeGate } from "./challenge.ts";
+import { bountyPdas, decodeBounty, decodeBountyConfig, decodeBountyLedger, type BountyAccount, type BountyConfig, type BountyLedger } from "./bounty.ts";
+import { decodeAgentLaunch, decodeLaunchConfig, LAUNCH_PROGRAM_ID, launchPdas, type AgentLaunch, type LaunchConfig } from "./launch.ts";
+import { decodeAgent, decodeClaimReceipt, decodeConfig, decodeEpoch, decodeSlashReceipt, REGISTRY_PROGRAM_ID, registryPdas, type AgentRecord,
+  type ClaimReceipt, type EpochRecord, type RegistryConfig, type SlashReceipt } from "./registry.ts";
+import type { AccountInfo, Rpc } from "./rpc.ts";
+import { decodeMint, decodeTokenAccount, type MintInfo } from "./spl.ts";
+
+// RPC readers over the decoders: one call per question, every figure read from chain.
+
+function owned(a: AccountInfo | null, program: Address): AccountInfo | null {
+  if (!a) return null;
+  if (a.owner !== program) throw new Error(`${a.address} is owned by ${a.owner}, not ${program}`);
+  return a;
+}
+
+export class ChainReader {
+  constructor(
+    readonly rpc: Rpc,
+    registryProgram: Address = REGISTRY_PROGRAM_ID,
+    launchProgram: Address = LAUNCH_PROGRAM_ID,
+  ) {
+    if (registryProgram !== REGISTRY_PROGRAM_ID || launchProgram !== LAUNCH_PROGRAM_ID)
+      throw new Error("packages/chain derives PDAs for the active network's program ids only (programs.ts)");
+  }
+  /** The active network's ids (programs.ts), read on every call so a profile applied later is followed. */
+  get registryProgram(): Address {
+    return REGISTRY_PROGRAM_ID;
+  }
+  get launchProgram(): Address {
+    return LAUNCH_PROGRAM_ID;
+  }
+
+  async registryConfig(): Promise<RegistryConfig | null> {
+    const a = owned(await this.rpc.getAccountInfo(registryPdas.config()), this.registryProgram);
+    return a ? decodeConfig(a.data) : null;
+  }
+  async launchConfig(): Promise<LaunchConfig | null> {
+    const a = owned(await this.rpc.getAccountInfo(launchPdas.config()), this.launchProgram);
+    return a ? decodeLaunchConfig(a.data) : null;
+  }
+  async agent(agent: Address): Promise<AgentRecord | null> {
+    const a = owned(await this.rpc.getAccountInfo(registryPdas.agent(agent)), this.registryProgram);
+    return a ? decodeAgent(a.data) : null;
+  }
+  /** Every `Agent` record of the registry (getProgramAccounts on the account discriminator). */
+  async agents(): Promise<AgentRecord[]> {
+    const all = await this.rpc.getProgramAccounts(this.registryProgram, { memcmp: [{ offset: 0, bytes: accountDisc("Agent") }] });
+    return all.map((a) => decodeAgent(a.data));
+  }
+  /** Every `AgentLaunch` of the launch program. */
+  async launches(): Promise<AgentLaunch[]> {
+    const all = await this.rpc.getProgramAccounts(this.launchProgram, { memcmp: [{ offset: 0, bytes: accountDisc("AgentLaunch") }] });
+    return all.map((a) => decodeAgentLaunch(a.data));
+  }
+  async agentLaunch(mint: Address): Promise<AgentLaunch | null> {
+    const a = owned(await this.rpc.getAccountInfo(launchPdas.agentLaunch(mint)), this.launchProgram);
+    return a ? decodeAgentLaunch(a.data) : null;
+  }
+  async epoch(n: bigint | number): Promise<EpochRecord | null> {
+    const a = owned(await this.rpc.getAccountInfo(registryPdas.epoch(n)), this.registryProgram);
+    return a ? decodeEpoch(a.data) : null;
+  }
+  /** Every `Epoch` account of the registry (getProgramAccounts on the account discriminator), by epoch. */
+  async epochs(): Promise<EpochRecord[]> {
+    const all = await this.rpc.getProgramAccounts(this.registryProgram, { memcmp: [{ offset: 0, bytes: accountDisc("Epoch") }] });
+    return all.map((a) => decodeEpoch(a.data)).sort((a, b) => (a.epoch < b.epoch ? -1 : 1));
+  }
+  /** The receipt of a slash Core sent (null if that slash id never landed). */
+  async slashReceipt(slashId: Uint8Array | string): Promise<SlashReceipt | null> {
+    const a = owned(await this.rpc.getAccountInfo(registryPdas.slashReceipt(slashId)), this.registryProgram);
+    return a ? decodeSlashReceipt(a.data) : null;
+  }
+  async claimReceipts(epoch: bigint | number, leaves: Uint8Array[]): Promise<(ClaimReceipt | null)[]> {
+    const accts = await this.rpc.getMultipleAccounts(leaves.map((l) => registryPdas.claimReceipt(epoch, l)));
+    return accts.map((a) => (owned(a, this.registryProgram) ? decodeClaimReceipt(a!.data) : null));
+  }
+  /** The receipts of several epochs' leaves in one read (100 addresses per getMultipleAccounts), one list per item in order. */
+  async claimReceiptsMany(items: { epoch: bigint | number; leaves: Uint8Array[] }[]): Promise<(ClaimReceipt | null)[][]> {
+    const accts = await this.rpc.getMultipleAccounts(items.flatMap((it) => it.leaves.map((l) => registryPdas.claimReceipt(it.epoch, l))));
+    let at = 0;
+    return items.map((it) => it.leaves.map(() => {
+      const a = accts[at++] ?? null;
+      return owned(a, this.registryProgram) ? decodeClaimReceipt(a!.data) : null;
+    }));
+  }
+  async bountyConfig(): Promise<BountyConfig | null> {
+    const a = owned(await this.rpc.getAccountInfo(bountyPdas.config()), this.launchProgram);
+    return a ? decodeBountyConfig(a.data) : null;
+  }
+  /** Every `Bounty` of the launch program, with its address. */
+  async bounties(): Promise<(BountyAccount & { address: Address })[]> {
+    const all = await this.rpc.getProgramAccounts(this.launchProgram, { memcmp: [{ offset: 0, bytes: accountDisc("Bounty") }] });
+    return all.map((a) => ({ ...decodeBounty(a.data), address: a.address }));
+  }
+  async bounty(address: Address): Promise<BountyAccount | null> {
+    const a = owned(await this.rpc.getAccountInfo(address), this.launchProgram);
+    return a ? decodeBounty(a.data) : null;
+  }
+  async bountyLedger(agent: Address): Promise<BountyLedger | null> {
+    const a = owned(await this.rpc.getAccountInfo(bountyPdas.ledger(agent)), this.launchProgram);
+    return a ? decodeBountyLedger(a.data) : null;
+  }
+  /** The bonded-challenge config (SPEC 10.8); null before the admin set it (claims are not held then). */
+  async challengeConfig(): Promise<ChallengeConfig | null> {
+    const a = owned(await this.rpc.getAccountInfo(registryPdas.challengeConfig()), this.registryProgram);
+    return a ? decodeChallengeConfig(a.data) : null;
+  }
+  /** Every `Challenge` of the registry, with its address. */
+  async challenges(): Promise<(ChallengeAccount & { address: Address })[]> {
+    const all = await this.rpc.getProgramAccounts(this.registryProgram, { memcmp: [{ offset: 0, bytes: accountDisc("Challenge") }] });
+    return all.map((a) => ({ ...decodeChallenge(a.data), address: a.address }));
+  }
+  async challenge(kind: number, subject: Uint8Array | string): Promise<ChallengeAccount | null> {
+    const a = owned(await this.rpc.getAccountInfo(registryPdas.challenge(kind, subject)), this.registryProgram);
+    return a ? decodeChallenge(a.data) : null;
+  }
+  async challengeGate(n: bigint | number): Promise<ChallengeGate | null> {
+    const a = owned(await this.rpc.getAccountInfo(registryPdas.challengeGate(n)), this.registryProgram);
+    return a ? decodeChallengeGate(a.data) : null;
+  }
+  /** Token balances of the given accounts; a missing account reads as null. */
+  async tokenBalances(accounts: Address[]): Promise<(bigint | null)[]> {
+    const accts = await this.rpc.getMultipleAccounts(accounts);
+    return accts.map((a) => (a ? decodeTokenAccount(a.data).amount : null));
+  }
+  async tokenBalance(account: Address): Promise<bigint | null> {
+    return (await this.tokenBalances([account]))[0]!;
+  }
+  async mint(mint: Address): Promise<(MintInfo & { tokenProgram: Address }) | null> {
+    const a = await this.rpc.getAccountInfo(mint);
+    return a ? { ...decodeMint(a.data), tokenProgram: a.owner } : null;
+  }
+
+  /** The registry vaults and, when given, compute vaults: one getMultipleAccounts. */
+  async vaults(computeAgents: Address[] = []): Promise<{ slot: number; treasury: bigint | null; reserve: bigint | null; pool: bigint | null;
+    payable: bigint | null; bondVault: bigint | null; compute: Record<Address, bigint | null> }> {
+    const fixed = [registryPdas.treasury(), registryPdas.reserve(), registryPdas.pool(), registryPdas.payable(), registryPdas.bondVault()];
+    const compute = computeAgents.map((a) => launchPdas.computeVault(a));
+    const slot = await this.rpc.getSlot();
+    const b = await this.tokenBalances([...fixed, ...compute]);
+    return {
+      slot,
+      treasury: b[0]!, reserve: b[1]!, pool: b[2]!, payable: b[3]!, bondVault: b[4]!,
+      compute: Object.fromEntries(computeAgents.map((a, i) => [a, b[5 + i]!])),
+    };
+  }
+}
