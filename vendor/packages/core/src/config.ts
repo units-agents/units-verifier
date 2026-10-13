@@ -1,0 +1,326 @@
+import { readFileSync } from "node:fs";
+import { parsePrepayConfig, type PrepayConfig } from "@units/chain";
+
+// Network parameters (SPEC 13, config/network.json). Token amounts are integer base units, held as
+// bigint in Core and as decimal strings on disk and on the wire.
+
+export interface NetworkConfig {
+  quorum: number;
+  max_reassign: number;
+  det_tolerance: number;
+  bootstrap_resamples: number;
+  reveal_window_s: number;
+  replay_window_factor: number;
+  replay_window_min_s: number;
+  canary_rate: number;
+  audit_rate: number;
+  max_open_replays: number;
+  max_open_candidates_per_agent: number;
+  epoch_length_s: number;
+  register_burn: bigint;
+  min_bond: bigint;
+  bond_cap: bigint;
+  unbond_cooldown_s: number;
+  reserve_bps: number;
+  pool_bps: number;
+  u_replay: number;
+  u_author: number;
+  finder_share: number;
+  value_cap: number;
+  rebate_per_class: bigint;
+  canary_slash_bps: number;
+  minority_slash_bps: number;
+  reveal_slash_bps: number;
+  strike_limit: number;
+  token_decimals: number;
+  agent_compute_bps: number;
+  protocol_bps: number;
+  sleep_threshold: bigint;
+  wake_threshold: bigint;
+  /** Where author (and finder) epoch rewards are paid: the agent's compute vault or its launcher's wallet. */
+  author_reward_to: "compute" | "launcher";
+  /** Cooldown before a verifier may retry a failed or expired qualification (SPEC 6.1). Optional, default 600. */
+  qualify_retry_s: number;
+  /** Activity events accepted per agent per minute (SPEC 17.1). Optional, default 120. */
+  activity_rate: number;
+  /**
+   * Network compute (docs/plans/MODELS-AND-SELF-FUNDING.md section D): how old the hosted runtime's last
+   * spend report may be, in seconds, for an agent it reported as covered to still count as covered
+   * (its candidates are accepted while its vault is asleep). Optional, default 600.
+   */
+  network_compute_report_max_age_s: number;
+  /** Worker heartbeat period; a machine is awake while its last heartbeat is younger than 3x this (SPEC 17.1). Optional, default 10. */
+  heartbeat_s: number;
+  /** Random auditors drawn per audit besides the reference runner (SPEC 10.6). Optional, default 2. */
+  audit_replayers: number;
+  // Bonded challenges (SPEC 10.8). Defaults are test values; launch values are TBA (owner). Chain mode reads them from ChallengeConfig.
+  /** Seconds after a verdict is final, a slash lands or an epoch closes during which it may be challenged (and its payouts are held). Optional, default 3600. */
+  challenge_window_s: number;
+  /** Bond a challenger escrows, base units. Optional, default 1 token at token_decimals. */
+  challenge_bond: bigint;
+  /** Reward from the compute reserve to an upheld challenger, base units (capped by the reserve). Optional, default half a token. */
+  challenge_reward: bigint;
+  /** Fresh random replayers drawn per challenge besides the reference runner. Optional, default 1. */
+  challenge_replayers: number;
+  /** A challenge Core has not resolved after this many seconds is void (bond returned). Optional, default 7200. */
+  challenge_resolve_timeout_s: number;
+  /** Shadow author identities kept launched per lineage that has canaries (SPEC 10.5). Optional, default 3. */
+  shadow_pool: number;
+  /** Shadow launches are spread uniformly at random over this many seconds after they are planned. Optional, default 3600. */
+  shadow_launch_spread_s: number;
+  /** A shadow must have existed this long before it authors a canary. Optional, default 900. */
+  shadow_min_age_s: number;
+  /** Delay between the triggering assignment and the canary commit, drawn uniformly from [min, max] seconds. Optional, default [30, 600]. */
+  canary_inject_delay_s: [number, number];
+  /** Canary commit-to-reveal delay range in seconds, used until the lineage has 5 real reveals to sample from. Optional, default [5, 120]. */
+  canary_reveal_delay_s: [number, number];
+  // Collaboration (SPEC 12.1, 12.2). Defaults are test values; launch values are TBA (owner).
+  /** Intents an agent may hold publicly open at once (an intent that led to a commit counts until it publicly ends). Optional, default 3. */
+  max_intents_per_agent: number;
+  /** Longest intent TTL in seconds. Optional, default 3600. */
+  intent_max_ttl_s: number;
+  /** Intents an agent may file per hour. Optional, default 20. */
+  intent_rate_per_hour: number;
+  /** Activity window of the lineage workboard, seconds. Optional, default 600. */
+  workboard_window_s: number;
+  /** Members of a team candidate, the lead included. Optional, default 4. */
+  max_team_size: number;
+  /** Eligible bond a team may exclude from replaying its candidate beyond the lead's own group, in bps of the lineage's eligible bond. Optional, default 2500. */
+  max_team_excluded_bond_bps: number;
+  /** Open candidates a stacked candidate may sit on (its `depends_on` chain until the first final one). Optional, default 3 (SPEC 12.4). */
+  max_series_depth: number;
+  /** Messages (direct and board) an agent may send per minute. Optional, default 20 (SPEC 12.3). */
+  msg_rate_per_min: number;
+  /** Messages an agent may send per day. Optional, default 500 (SPEC 12.3). */
+  msg_daily: number;
+  /** Largest message body (plaintext or ciphertext) in bytes. Optional, default 4096 (SPEC 12.3). */
+  msg_max_bytes: number;
+  /** Members (= sub-patches) of a team candidate with a measured split. Optional, default 3 (SPEC 12.6, test value). */
+  max_split_members: number;
+  /** Share of a port's author units credited to the original generation's authors, bps. Optional, default 2000 (SPEC 12.7, test value). */
+  port_share_bps: number;
+  /** Units credited to a generation's authors when its change is detected merged upstream. Optional, default 2 (SPEC 16, test value). */
+  upstream_bonus: number;
+  /** Prepaid credits at launch (plan C): minimum and default deposit, the $UNITS rate (TEST on devnet). Optional; absent = no minimum. */
+  prepay?: PrepayConfig | null;
+  /** Feature flags (docs/plans/AGENT-POOLS.md 2, GITHUB-FEE-CLAIMS.md 2). Both false unless the config sets them; UNITS_FEATURE_<NAME>=1|0 overrides for one process (features.ts). */
+  features: { agent_pools: boolean; github_fee_claims: boolean; swarms: boolean };
+  /** Swarm settings (docs/plans/SWARMS.md 4, 5; swarms.ts). Read only while features.swarms is on; the admin edits them with POST /v1/admin/swarms/config. */
+  swarm: SwarmSettings;
+  /** Guard limits (SPEC 10.1 rule 6): default max regression of a non-target metric, a fraction. Optional, default 0.01; seeds guard config version 1. */
+  guard_max_regression: number;
+  /** When guard config version 1 takes effect (ms); Core seeds it at max(this, its clock) on first start. Optional; absent or null = guards off until an admin sets a version. */
+  guard_activation_ms: number | null;
+}
+
+/**
+ * Swarm settings (docs/plans/SWARMS.md). Every value is configuration; none is fixed in code.
+ * `seat_desktop_usd_per_h`: what a running screen of seats past `seat_desktop_free_seats` costs the
+ * swarm's vault per hour; null means the desktop service's own rate for the time the screen ran, 0
+ * means no charge.
+ */
+export interface SwarmSettings {
+  /** largest swarm a launch may declare (the soul validator's hard bound is 16) */
+  max_members: number;
+  seat_desktop_usd_per_h: number | null;
+  /** how many seats' screens the platform pays, counted from seat 1 */
+  seat_desktop_free_seats: number;
+  /** optional caps per usage epoch, USD of model spend: the whole swarm, and one seat */
+  swarm_epoch_max_usd: number | null;
+  seat_epoch_max_usd: number | null;
+  /** attempt slots when scarce: one per coin before any coin's second seat ("coin"), or by seat alone ("seat") */
+  slot_fairness: "coin" | "seat";
+  /** the lead's planning call before a round; and its cost cap in USD (null: the runtime's journal reserve) */
+  lead_plan: boolean;
+  lead_plan_max_usd: number | null;
+  /**
+   * Who may launch a swarm: null (default) is every wallet; a list is only those launcher wallets
+   * (at most 64). While a list is set, an agent launched by another wallet is a solo agent whatever
+   * its soul says, and the launch form shows the Agents field to a listed wallet only. Never
+   * published: GET /v1/swarms/config says only whether the asking wallet may.
+   */
+  launchers: string[] | null;
+}
+
+export const SWARM_DEFAULTS: SwarmSettings = { max_members: 4, seat_desktop_usd_per_h: null, seat_desktop_free_seats: 1, swarm_epoch_max_usd: null, seat_epoch_max_usd: null, slot_fairness: "coin", lead_plan: true, lead_plan_max_usd: null, launchers: null };
+
+/** Checks a swarm settings object (or a patch of one, with `partial`). Throws with the field at fault. */
+export function parseSwarmSettings(raw: unknown, base: SwarmSettings = SWARM_DEFAULTS): SwarmSettings {
+  if (raw === undefined || raw === null) return { ...base };
+  if (typeof raw !== "object" || Array.isArray(raw)) throw new Error("swarm settings: must be an object");
+  const r = raw as Record<string, unknown>;
+  const out: SwarmSettings = { ...base };
+  const usd = (k: "seat_desktop_usd_per_h" | "swarm_epoch_max_usd" | "seat_epoch_max_usd" | "lead_plan_max_usd") => {
+    if (r[k] === undefined) return;
+    if (r[k] !== null && !(typeof r[k] === "number" && Number.isFinite(r[k]) && (r[k] as number) >= 0)) throw new Error(`swarm settings: ${k} must be a non-negative number of USD or null`);
+    out[k] = r[k] as number | null;
+  };
+  for (const k of Object.keys(r)) if (!k.startsWith("_") && !(k in SWARM_DEFAULTS)) throw new Error(`swarm settings: unknown field ${k}`);
+  if (r.max_members !== undefined) {
+    if (typeof r.max_members !== "number" || !Number.isInteger(r.max_members) || r.max_members < 1 || r.max_members > 16) throw new Error("swarm settings: max_members must be an integer from 1 to 16");
+    out.max_members = r.max_members;
+  }
+  if (r.seat_desktop_free_seats !== undefined) {
+    if (typeof r.seat_desktop_free_seats !== "number" || !Number.isInteger(r.seat_desktop_free_seats) || r.seat_desktop_free_seats < 0 || r.seat_desktop_free_seats > 16) throw new Error("swarm settings: seat_desktop_free_seats must be an integer from 0 to 16");
+    out.seat_desktop_free_seats = r.seat_desktop_free_seats;
+  }
+  usd("seat_desktop_usd_per_h");
+  usd("swarm_epoch_max_usd");
+  usd("seat_epoch_max_usd");
+  usd("lead_plan_max_usd");
+  if (r.slot_fairness !== undefined) {
+    if (r.slot_fairness !== "coin" && r.slot_fairness !== "seat") throw new Error('swarm settings: slot_fairness must be "coin" or "seat"');
+    out.slot_fairness = r.slot_fairness;
+  }
+  if (r.lead_plan !== undefined) {
+    if (typeof r.lead_plan !== "boolean") throw new Error("swarm settings: lead_plan must be true or false");
+    out.lead_plan = r.lead_plan;
+  }
+  if (r.launchers !== undefined) {
+    const l = r.launchers;
+    if (l !== null && !(Array.isArray(l) && l.length <= 64 && l.every((w) => typeof w === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(w)) && new Set(l).size === l.length))
+      throw new Error("swarm settings: launchers must be null (every wallet) or a list of at most 64 distinct wallet addresses");
+    out.launchers = l === null ? null : [...(l as string[])];
+  }
+  return out;
+}
+
+const AMOUNT_KEYS = ["register_burn", "min_bond", "bond_cap", "rebate_per_class", "sleep_threshold", "wake_threshold"] as const;
+const NUMBER_KEYS = [
+  "quorum",
+  "max_reassign",
+  "det_tolerance",
+  "bootstrap_resamples",
+  "reveal_window_s",
+  "replay_window_factor",
+  "replay_window_min_s",
+  "canary_rate",
+  "audit_rate",
+  "max_open_replays",
+  "max_open_candidates_per_agent",
+  "epoch_length_s",
+  "unbond_cooldown_s",
+  "reserve_bps",
+  "pool_bps",
+  "u_replay",
+  "u_author",
+  "finder_share",
+  "value_cap",
+  "canary_slash_bps",
+  "minority_slash_bps",
+  "reveal_slash_bps",
+  "strike_limit",
+  "token_decimals",
+  "agent_compute_bps",
+  "protocol_bps",
+] as const;
+
+export function parseNetworkConfig(raw: Record<string, unknown>): NetworkConfig {
+  const out: Record<string, unknown> = {};
+  for (const k of NUMBER_KEYS) {
+    const v = raw[k];
+    if (typeof v !== "number" || !Number.isFinite(v)) throw new Error(`network config: ${k} must be a number`);
+    out[k] = v;
+  }
+  for (const k of AMOUNT_KEYS) {
+    const v = raw[k];
+    if (typeof v !== "string" && typeof v !== "number") throw new Error(`network config: ${k} must be an integer string`);
+    const s = String(v);
+    if (!/^\d+$/.test(s)) throw new Error(`network config: ${k} must be a non-negative integer`);
+    out[k] = BigInt(s);
+  }
+  const to = raw.author_reward_to ?? "compute";
+  if (to !== "compute" && to !== "launcher") throw new Error('network config: author_reward_to must be "compute" or "launcher"');
+  out.author_reward_to = to;
+  const retry = raw.qualify_retry_s ?? 600;
+  if (typeof retry !== "number" || !Number.isFinite(retry) || retry < 0) throw new Error("network config: qualify_retry_s must be a non-negative number");
+  out.qualify_retry_s = retry;
+  const rate = raw.activity_rate ?? 120;
+  if (typeof rate !== "number" || !Number.isInteger(rate) || rate < 1) throw new Error("network config: activity_rate must be a positive integer");
+  out.activity_rate = rate;
+  const hb = raw.heartbeat_s ?? 10;
+  if (typeof hb !== "number" || !Number.isFinite(hb) || hb < 1) throw new Error("network config: heartbeat_s must be a number of at least 1");
+  out.heartbeat_s = hb;
+  const ncAge = raw.network_compute_report_max_age_s ?? 600;
+  if (typeof ncAge !== "number" || !Number.isFinite(ncAge) || ncAge < 0) throw new Error("network config: network_compute_report_max_age_s must be a number of seconds, 0 or more");
+  out.network_compute_report_max_age_s = ncAge;
+  const posInt = (k: string, def: number, min: number) => {
+    const v = raw[k] ?? def;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < min) throw new Error(`network config: ${k} must be an integer of at least ${min}`);
+    out[k] = v;
+  };
+  posInt("audit_replayers", 2, 1);
+  posInt("challenge_window_s", 3600, 1);
+  posInt("challenge_replayers", 1, 1);
+  posInt("challenge_resolve_timeout_s", 7200, 1);
+  const tokenUnit = 10n ** BigInt(Number.isInteger(out.token_decimals) ? (out.token_decimals as number) : 0);
+  for (const [k, def] of [["challenge_bond", tokenUnit], ["challenge_reward", tokenUnit / 2n]] as const) {
+    const s = String(raw[k] ?? def);
+    if (!/^\d+$/.test(s)) throw new Error(`network config: ${k} must be a non-negative integer`);
+    out[k] = BigInt(s);
+  }
+  posInt("shadow_pool", 3, 0);
+  posInt("shadow_launch_spread_s", 3600, 0);
+  posInt("shadow_min_age_s", 900, 0);
+  const range = (k: string, def: [number, number]) => {
+    const v = raw[k] ?? def;
+    if (!Array.isArray(v) || v.length !== 2 || !v.every((x) => typeof x === "number" && Number.isFinite(x) && x >= 0) || v[0] > v[1])
+      throw new Error(`network config: ${k} must be [min, max] seconds with 0 <= min <= max`);
+    out[k] = [v[0], v[1]];
+  };
+  posInt("max_intents_per_agent", 3, 1);
+  posInt("intent_max_ttl_s", 3600, 1);
+  posInt("intent_rate_per_hour", 20, 1);
+  posInt("workboard_window_s", 600, 1);
+  posInt("max_team_size", 4, 2);
+  posInt("max_team_excluded_bond_bps", 2500, 0);
+  posInt("max_series_depth", 3, 1);
+  posInt("msg_rate_per_min", 20, 1);
+  posInt("msg_daily", 500, 1);
+  posInt("msg_max_bytes", 4096, 64);
+  posInt("max_split_members", 3, 2);
+  posInt("port_share_bps", 2000, 0);
+  if ((out.port_share_bps as number) > 10_000) throw new Error("network config: port_share_bps exceeds 10000");
+  posInt("upstream_bonus", 2, 0);
+  range("canary_inject_delay_s", [30, 600]);
+  range("canary_reveal_delay_s", [5, 120]);
+  const gmr = raw.guard_max_regression ?? 0.01;
+  if (typeof gmr !== "number" || !Number.isFinite(gmr) || gmr < 0 || gmr > 1) throw new Error("network config: guard_max_regression must be a fraction from 0 to 1");
+  out.guard_max_regression = gmr;
+  const gam = raw.guard_activation_ms ?? null;
+  if (gam !== null && (typeof gam !== "number" || !Number.isSafeInteger(gam) || gam < 0)) throw new Error("network config: guard_activation_ms must be a non-negative integer (ms) or null");
+  out.guard_activation_ms = gam;
+  out.prepay = raw.prepay === undefined || raw.prepay === null ? null : parsePrepayConfig(raw.prepay);
+  const feats = (raw.features ?? {}) as Record<string, unknown>;
+  if (typeof feats !== "object" || Array.isArray(feats)) throw new Error("network config: features must be an object");
+  for (const k of ["agent_pools", "github_fee_claims", "swarms"]) if (feats[k] !== undefined && typeof feats[k] !== "boolean") throw new Error(`network config: features.${k} must be true or false`);
+  out.features = { agent_pools: feats.agent_pools === true, github_fee_claims: feats.github_fee_claims === true, swarms: feats.swarms === true };
+  try {
+    out.swarm = parseSwarmSettings(raw.swarm);
+  } catch (e) {
+    throw new Error(`network config: ${(e as Error).message}`);
+  }
+  const cfg = out as unknown as NetworkConfig;
+  if (cfg.agent_compute_bps + cfg.protocol_bps > 10_000) throw new Error("network config: agent_compute_bps + protocol_bps exceeds 10000");
+  if (cfg.wake_threshold < cfg.sleep_threshold) throw new Error("network config: wake_threshold below sleep_threshold");
+  if (cfg.quorum < 1) throw new Error("network config: quorum must be at least 1");
+  if (cfg.reserve_bps + cfg.pool_bps > 10_000) throw new Error("network config: reserve_bps + pool_bps exceeds 10000");
+  return cfg;
+}
+
+export function loadNetworkConfig(path: string): NetworkConfig {
+  return parseNetworkConfig(JSON.parse(readFileSync(path, "utf8")));
+}
+
+/** JSON view of the config (amounts as strings). */
+export function networkConfigJson(cfg: NetworkConfig): Record<string, unknown> {
+  const o: Record<string, unknown> = { ...cfg };
+  for (const k of AMOUNT_KEYS) o[k] = cfg[k].toString();
+  for (const k of ["challenge_bond", "challenge_reward"] as const) if (typeof cfg[k] === "bigint") o[k] = cfg[k].toString();
+  // the swarm launcher list is not published (GET /v1/swarms/config?wallet= answers for one wallet)
+  if (cfg.swarm) {
+    const { launchers: _l, ...rest } = cfg.swarm;
+    o.swarm = rest;
+  }
+  return o;
+}

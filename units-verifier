@@ -46,6 +46,11 @@ case "$KEY" in /*) ;; *) KEY=$HERE/${KEY#./} ;; esac
 # an extra label for the image and the containers this wrapper starts (for a machine shared with others)
 LABEL=${UNITS_EXTRA_LABEL:+--label $UNITS_EXTRA_LABEL}
 
+# a command that talks to the network needs an address
+need_core() {
+  [ -n "$CORE" ] || { echo "no Core address for $NETWORK: set UNITS_SITE_$(echo "$NETWORK" | tr a-z A-Z) in units.env, or pass --core <url>" >&2; exit 2; }
+}
+
 usage() {
   cat <<USAGE
 units-verifier [--network mainnet|devnet] [--core <url>] <command> [arguments]
@@ -124,15 +129,15 @@ case "$cmd" in
     # shellcheck disable=SC2086
     exec docker build $LABEL -t "$IMAGE" "$@" "$HERE" ;;
   source|worker-help) run_plain "$cmd" "$@" ;;
-  params|latest) run_plain "$cmd" --core "$CORE" "$@" ;;
-  verify) run_plain verify --core "$CORE" "$@" ;;
-  verify-generation) run_plain verify-generation --core "$CORE" "$@" ;;
+  params|latest) need_core; run_plain "$cmd" --core "$CORE" "$@" ;;
+  verify) need_core; run_plain verify --core "$CORE" "$@" ;;
+  verify-generation) need_core; run_plain verify-generation --core "$CORE" "$@" ;;
   doctor)
     need_image
     # shellcheck disable=SC2086
     exec docker run --rm $LABEL -v "$SOCK:/var/run/docker.sock" "$IMAGE" doctor "$@" ;;
   images) run_sandbox images "$@" ;;
-  replay) run_sandbox replay --core "$CORE" "$@" ;;
+  replay) need_core; run_sandbox replay --core "$CORE" "$@" ;;
   calibrate|baseline)
     # a recipe directory or a --calibration file on the host is mounted at the same path in the container
     EXTRA_MOUNT=""; prev=""; first=1
@@ -155,7 +160,7 @@ case "$cmd" in
     mkdir -p "$(dirname "$KEY")"
     # shellcheck disable=SC2086
     exec docker run --rm $LABEL -v "$(dirname "$KEY"):/keys" "$IMAGE" keygen --out "/keys/$(basename "$KEY")" ;;
-  register|bond|status) run_key "$cmd" --core "$CORE" --key /keys/agent.json "$@" ;;
+  register|bond|status) need_core; run_key "$cmd" --core "$CORE" --key /keys/agent.json "$@" ;;
   cosign) run_key cosign --key /keys/agent.json "$@" ;;
   run)
     need_image; need_home; need_key
